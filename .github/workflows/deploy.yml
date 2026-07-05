@@ -1,5 +1,5 @@
 name: Deploy to Cloud Run
-id: deploy
+
 on:
   push:
     branches:
@@ -18,6 +18,7 @@ jobs:
           credentials_json: '${{ secrets.GCP_CREDENTIALS }}'
 
       - name: Deploy to Cloud Run
+        id: deploy
         uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: atothei-v16-api
