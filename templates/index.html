@@ -1,0 +1,788 @@
+#!/bin/bash
+
+APP_DIR="atothei_v16"
+echo "Creating directory structure..."
+mkdir -p $APP_DIR/templates
+cd $APP_DIR
+
+echo "Injecting database.py..."
+cat << 'EOF' > database.py
+import sqlite3
+import datetime
+import hashlib
+
+DB_FILE = "atothei.db"
+
+def hash_pw(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, avatar_data TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT, user TEXT, avatar TEXT, text TEXT, file_name TEXT, file_type TEXT, file_data TEXT, is_encrypted INTEGER, reactions INTEGER DEFAULT 0, burn INTEGER DEFAULT 0, burn_seconds INTEGER DEFAULT 10, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        conn.commit()
+
+def save_user(user, pwd):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("INSERT INTO users (username, password, avatar_data) VALUES (?, ?, ?)", (user, hash_pw(pwd), ""))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def verify_user(user, pwd):
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT password FROM users WHERE username = ?", (user,)).fetchone()
+        return row and row[0] == hash_pw(pwd)
+
+def update_avatar(user, avatar_data):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE users SET avatar_data = ? WHERE username = ?", (avatar_data, user))
+
+def get_user_avatar(user):
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT avatar_data FROM users WHERE username = ?", (user,)).fetchone()
+        return row[0] if row else ""
+
+def save_message(room, user, avatar, text, file_data=None, is_enc=0, is_burn=0, burn_seconds=10):
+    fname = file_data['name'] if file_data else None
+    ftype = file_data['type'] if file_data else None
+    fdata = file_data['data'] if file_data else None
+    ts = datetime.datetime.now().strftime("%I:%M %p")
+    
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.execute(
+            "INSERT INTO messages (room, user, avatar, text, file_name, file_type, file_data, is_encrypted, burn, burn_seconds, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (room, user, avatar, text, fname, ftype, fdata, 1 if is_enc else 0, 1 if is_burn else 0, burn_seconds, ts)
+        )
+        return cur.lastrowid, ts
+
+def delete_message(msg_id):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM messages WHERE id = ?", (msg_id,))
+
+def add_reaction(msg_id):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE messages SET reactions = reactions + 1 WHERE id = ?", (msg_id,))
+        row = conn.execute("SELECT reactions FROM messages WHERE id = ?", (msg_id,)).fetchone()
+        return row[0] if row else 0
+
+def clear_room(room):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM messages WHERE room = ?", (room,))
+
+def get_history(room):
+    history = []
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.execute(
+            "SELECT id, user, avatar, text, file_name, file_type, file_data, is_encrypted, reactions, burn, burn_seconds, timestamp FROM messages WHERE room = ? ORDER BY id DESC LIMIT 50",
+            (room,)
+        )
+        rows = cur.fetchall()
+        for r in reversed(rows):
+            msg = {
+                'id': r[0], 'user': r[1], 'avatar': r[2], 'text': r[3], 'isEncrypted': r[7], 
+                'reactions': r[8], 'burn': r[9], 'burnSeconds': r[10], 'time': r[11], 'room': room
+            }
+            if r[4]:
+                msg['file'] = {'name': r[4], 'type': r[5], 'data': r[6]}
+            history.append(msg)
+    return history
+EOF
+
+echo "Injecting app.py..."
+cat << 'EOF' > app.py
+import os
+import socket
+import subprocess
+import threading
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO, emit, join_room, leave_room
+import database as db
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'atothei_v16_complete'
+MAX_BUFFER = 100 * 1024 * 1024
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', max_http_buffer_size=MAX_BUFFER)
+
+connected_users = {}
+room_members = {}
+
+def start_public_tunnel():
+    print("\n[INIT] Starting Global Tunnel...")
+    cmd = "ssh -R 80:localhost:5000 localhost.run -o StrictHostKeyChecking=no -o ServerAliveInterval=60"
+    def run_ssh():
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                print(f"[SSH] {line}")
+            if ("localhost.run" in line or "lhr.life" in line) and "http" in line and "docs" not in line:
+                try:
+                    url = line[line.find("http"):].split(" ")[0]
+                    print(f"\n✅ GLOBAL LINK: {url}")
+                except:
+                    pass
+    t = threading.Thread(target=run_ssh)
+    t.daemon = True
+    t.start()
+
+def schedule_burn(msg_id, room, seconds):
+    def do_burn():
+        db.delete_message(msg_id)
+        socketio.emit('burn_msg', {'id': msg_id, 'room': room}, to=room)
+    t = threading.Timer(seconds, do_burn)
+    t.daemon = True
+    t.start()
+
+def get_all_active_users_data():
+    active_names = list(set(connected_users.values()))
+    users_data = []
+    for name in active_names:
+        ava = db.get_user_avatar(name)
+        users_data.append({'name': name, 'avatar': ava})
+    return users_data
+
+def broadcast_users():
+    socketio.emit('update_users', get_all_active_users_data())
+
+def broadcast_room_count(room):
+    members = room_members.get(room, set())
+    names = list(set(connected_users.get(sid, '') for sid in members if sid in connected_users))
+    names = [n for n in names if n]
+    socketio.emit('room_users', {'room': room, 'count': len(names), 'names': names}, to=room)
+
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/api/snap', methods=['POST'])
+def snap_api():
+    data = request.get_json(silent=True) or {}
+    text = str(data.get('text', ''))[:250]
+    room = str(data.get('room', 'general'))
+    return jsonify({
+        'caption': text + ' · via Atothei',
+        'attachmentUrl': request.host_url,
+        'room': room,
+        'status': 'ok'
+    })
+
+@socketio.on('disconnect')
+def on_disco():
+    u = connected_users.get(request.sid, '')
+    if request.sid in connected_users:
+        del connected_users[request.sid]
+    for r in list(room_members.keys()):
+        if request.sid in room_members[r]:
+            room_members[r].discard(request.sid)
+            broadcast_room_count(r)
+            if u:
+                socketio.emit('sys_msg', {'room': r, 'text': f'{u} left'}, to=r)
+    broadcast_users()
+
+@socketio.on('auth')
+def handle_auth(data):
+    u, p, t = data['user'], data['pass'], data['type']
+    success = False
+    if t == 'register':
+        if db.save_user(u, p):
+            success = True
+        else:
+            emit('auth_response', {'success': False, 'message': 'Username taken'})
+    else:
+        if db.verify_user(u, p):
+            success = True
+        else:
+            emit('auth_response', {'success': False, 'message': 'Wrong username or password'})
+            
+    if success:
+        connected_users[request.sid] = u
+        ava = db.get_user_avatar(u)
+        emit('auth_response', {'success': True, 'user': u, 'avatar': ava})
+        broadcast_users()
+
+@socketio.on('join_channel')
+def on_join(data):
+    r = data['room']
+    join_room(r)
+    if r not in room_members:
+        room_members[r] = set()
+    room_members[r].add(request.sid)
+    
+    emit('history', db.get_history(r))
+    broadcast_users()
+    broadcast_room_count(r)
+    
+    u = connected_users.get(request.sid, '')
+    if u:
+        socketio.emit('sys_msg', {'room': r, 'text': f'{u} joined'}, to=r)
+
+@socketio.on('leave_channel')
+def on_leave(data):
+    r = data['room']
+    leave_room(r)
+    if r in room_members:
+        room_members[r].discard(request.sid)
+        broadcast_users()
+        broadcast_room_count(r)
+        u = connected_users.get(request.sid, '')
+        if u:
+            socketio.emit('sys_msg', {'room': r, 'text': f'{u} left'}, to=r)
+
+@socketio.on('send_msg')
+def on_msg(data):
+    ava = db.get_user_avatar(data['user'])
+    burn_sec = int(data.get('burnSeconds', 10))
+    mid, ts = db.save_message(
+        data['room'], data['user'], ava, data.get('text'), 
+        data.get('file'), data.get('isEncrypted', False), 
+        data.get('burn', False), burn_sec
+    )
+    
+    data['id'] = mid
+    data['avatar'] = ava
+    data['reactions'] = 0
+    data['time'] = ts	
+    data['burnSeconds'] = burn_sec
+    emit('message', data, to=data['room'])
+    
+    if data.get('burn'):
+        schedule_burn(mid, data['room'], burn_sec)
+
+@socketio.on('react_msg')
+def on_react(data):
+    new_count = db.add_reaction(data['id'])
+    emit('reaction_update', {'id': data['id'], 'reactions': new_count}, to=data['room'])
+
+@socketio.on('typing')
+def on_typing(data):
+    emit('display_typing', data, to=data['room'], include_self=False)
+
+@socketio.on('update_avatar')
+def on_ava(data):
+    db.update_avatar(data['user'], data['avatar'])
+    broadcast_users()
+
+@socketio.on('admin_clear')
+def on_clear(data):
+    db.clear_room(data['room'])
+    emit('clear_chat', data['room'], to=data['room'])
+
+if __name__ == '__main__':
+    db.init_db()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except:
+        ip = "127.0.0.1"
+        
+    print("\n" + "="*44)
+    print(" ATOTHEI V16 - MODULARIZED")
+    print(" ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f" Local: http://{ip}:5000")
+    start_public_tunnel()
+    print("="*44 + "\n")
+    
+    socketio.run(app, host='0.0.0.0', port=5000)
+EOF
+
+echo "Injecting templates/index.html..."
+cat << 'EOF' > templates/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Atothei V16</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Sora:wght@400;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+    <script src="https://sdk.snapkit.com/js/v1/create.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        :root { --bg: #0d0d12; --surface: #13131a; --surface2: #1a1a24; --border: rgba(255,255,255,0.07); --text: #e8e8f0; --muted: rgba(232,232,240,0.45); --sent: #5b5bf0; --sent-glow: rgba(91,91,240,0.3); --recv: #1e1e2e; --accent: #5b5bf0; --accent2: #a78bfa; --danger: #f05b5b; --green: #5bf0a0; --font: 'Sora', sans-serif; --mono: 'DM Mono', monospace; }
+        body.theme-void { --bg: #000; --surface: #080808; --surface2: #0f0f0f; --sent: #ff2d55; --sent-glow: rgba(255,45,85,0.3); --recv: #111; --accent: #ff2d55; --accent2: #ff6b8a; }
+        body.theme-forest { --bg: #080e0a; --surface: #0d1610; --surface2: #121f15; --sent: #22c55e; --sent-glow: rgba(34,197,94,0.3); --recv: #0f1f12; --accent: #22c55e; --accent2: #86efac; }
+        body.theme-chrome { --bg: #f0f0f5; --surface: #fafaff; --surface2: #ededf5; --border: rgba(0,0,0,0.08); --text: #1a1a2e; --muted: rgba(26,26,46,0.45); --sent: #5b5bf0; --recv: #e8e8f5; --accent: #5b5bf0; }
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: var(--font); background: var(--bg); color: var(--text); height: 100vh; overflow: hidden; transition: background 0.4s, color 0.4s; }
+        ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+        header { position: fixed; top: 0; left: 0; width: 100%; height: 54px; background: var(--surface); border-bottom: 1px solid var(--border); z-index: 40; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; backdrop-filter: blur(20px); }
+        .header-left { display: flex; align-items: center; gap: 14px; }
+        .menu-btn { width: 34px; height: 34px; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-size: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.2s; }
+        .menu-btn:hover { background: var(--accent); }
+        .header-title { font-size: 15px; font-weight: 600; letter-spacing: -0.3px; }
+        .header-sub { font-size: 10px; color: var(--muted); font-family: var(--mono); margin-top: 1px; }
+        .header-right { display: flex; align-items: center; gap: 10px; }
+        .pill-btn { display: flex; align-items: center; gap: 5px; background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 5px 12px; font-size: 12px; color: var(--text); cursor: pointer; transition: border-color 0.2s; }
+        .pill-btn:hover { border-color: var(--accent); color: var(--accent); }
+        #reconnect-banner { display: none; position: fixed; top: 54px; left: 0; width: 100%; background: var(--danger); color: white; text-align: center; padding: 6px; font-size: 12px; font-family: var(--mono); z-index: 45; letter-spacing: 0.5px; }
+        #messages { position: absolute; top: 54px; bottom: 64px; left: 0; width: 100%; overflow-y: auto; padding: 16px 16px 8px; display: flex; flex-direction: column; gap: 10px; }
+        .msg-row { display: flex; gap: 8px; max-width: 82%; align-items: flex-end; animation: fadeUp 0.2s ease; }
+        @keyframes fadeUp { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+        .msg-row.sent { align-self: flex-end; flex-direction: row-reverse; } .msg-row.received { align-self: flex-start; }
+        .avatar { width: 30px; height: 30px; border-radius: 50%; background: var(--surface2); background-size: cover; background-position: center; border: 1px solid var(--border); flex-shrink: 0; }
+        .avatar.lg { width: 64px; height: 64px; margin: 0 auto 12px; display: block; border: 2px solid var(--accent); }
+        .msg-bubble { padding: 10px 14px; border-radius: 16px; font-size: 14px; line-height: 1.5; word-wrap: break-word; background: var(--recv); color: var(--text); border: 1px solid var(--border); position: relative; max-width: 100%; }
+        .sent .msg-bubble { background: var(--sent); box-shadow: 0 0 20px var(--sent-glow); border-color: transparent; color: white; }
+        .burn-msg { border: 1px dashed var(--danger) !important; }
+        .msg-sender { font-size: 10px; opacity: 0.5; margin-bottom: 4px; font-family: var(--mono); }
+        .msg-time { font-size: 9px; opacity: 0.45; text-align: right; margin-top: 5px; font-family: var(--mono); }
+        .burn-timer { font-size: 10px; color: var(--danger); font-weight: 500; margin-top: 3px; }
+        .chat-media { max-width: 100%; border-radius: 10px; margin-top: 6px; display: block; }
+        .reaction-bar { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
+        .react-btn { background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 2px 8px; font-size: 12px; cursor: pointer; color: var(--muted); transition: all 0.15s; font-family: var(--mono); }
+        .react-btn:hover { border-color: var(--accent); color: var(--accent); }
+        .composer { position: fixed; bottom: 0; left: 0; width: 100%; height: 64px; background: var(--surface); border-top: 1px solid var(--border); z-index: 50; display: flex; align-items: center; gap: 8px; padding: 0 12px; }
+        .compose-input { flex: 1; padding: 10px 16px; border-radius: 22px; border: 1px solid var(--border); background: var(--surface2); color: var(--text); font-size: 14px; font-family: var(--font); outline: none; transition: border-color 0.2s; }
+        .compose-input:focus { border-color: var(--accent); }
+        .compose-input::placeholder { color: var(--muted); }
+        .icon-btn { width: 38px; height: 38px; border-radius: 50%; border: none; cursor: pointer; font-size: 15px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all 0.15s; }
+        .icon-btn.ghost { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); } .icon-btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+        .icon-btn.danger { background: var(--danger); color: white; }
+        .icon-btn.primary { background: var(--accent); color: white; box-shadow: 0 0 12px var(--sent-glow); }
+        .icon-btn.burn-on { background: var(--danger); color: white; }
+        .icon-btn.snap { background: #FFFC00; color: #000; border: none; } .icon-btn.snap:hover { opacity: 0.8; transform: scale(1.05); }
+        #typing-bar { display: none; position: fixed; bottom: 69px; left: 16px; background: var(--surface2); border: 1px solid var(--border); color: var(--muted); padding: 4px 10px; border-radius: 10px; font-size: 11px; font-family: var(--mono); z-index: 45; }
+        #sidebar { position: fixed; top: 0; left: 0; width: 270px; height: 100%; background: var(--surface); z-index: 90; transform: translateX(-100%); transition: transform 0.3s cubic-bezier(0.4,0,0.2,1); box-shadow: 4px 0 30px rgba(0,0,0,0.5); display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+        #sidebar.open { transform: translateX(0); }
+        .sb-header { padding: 24px 20px 16px; border-bottom: 1px solid var(--border); text-align: center; }
+        .sb-avatar { width: 56px; height: 56px; border-radius: 50%; background: var(--surface2); background-size: cover; background-position: center; margin: 0 auto 10px; border: 2px solid var(--accent); cursor: pointer; transition: opacity 0.2s; } .sb-avatar:hover { opacity: 0.8; }
+        .sb-name { font-weight: 600; font-size: 14px; letter-spacing: -0.3px; }
+        .theme-row { display: flex; gap: 6px; justify-content: center; margin-top: 10px; }
+        .theme-dot { width: 18px; height: 18px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; transition: border-color 0.2s; } .theme-dot:hover { border-color: white; }
+        .sb-section { padding: 8px 12px 4px; font-size: 10px; color: var(--muted); font-family: var(--mono); text-transform: uppercase; letter-spacing: 1px; }
+        .chat-item { padding: 10px 14px; margin: 2px 8px; border-radius: 8px; cursor: pointer; font-size: 13px; transition: background 0.15s; display: flex; align-items: center; justify-content: space-between; }
+        .chat-item:hover { background: var(--surface2); } .chat-item.active { background: rgba(91,91,240,0.15); color: var(--accent2); }
+        .unread-badge { background: var(--danger); color: white; border-radius: 10px; padding: 1px 6px; font-size: 10px; font-family: var(--mono); }
+        .sb-new-btn { padding: 14px; background: var(--accent); color: white; text-align: center; font-weight: 600; font-size: 13px; cursor: pointer; letter-spacing: 0.3px; transition: opacity 0.2s; } .sb-new-btn:hover { opacity: 0.85; }
+        #overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 89; background: rgba(0,0,0,0.6); display: none; backdrop-filter: blur(2px); }
+        .modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); z-index: 99; display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+        .box { background: var(--surface); padding: 24px; border-radius: 18px; width: 88%; max-width: 320px; display: flex; flex-direction: column; gap: 12px; color: var(--text); max-height: 85vh; overflow-y: auto; border: 1px solid var(--border); box-shadow: 0 20px 60px rgba(0,0,0,0.6); }
+        .box h2 { font-size: 22px; letter-spacing: -0.5px; } .box h3 { font-size: 16px; font-weight: 600; }
+        .box-sub { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: -8px; }
+        .field { padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface2); color: var(--text); font-size: 14px; font-family: var(--font); outline: none; transition: border-color 0.2s; width: 100%; } .field:focus { border-color: var(--accent); } .field::placeholder { color: var(--muted); }
+        .btn-primary { padding: 12px; background: var(--accent); border: none; color: white; border-radius: 10px; font-size: 14px; font-family: var(--font); font-weight: 600; cursor: pointer; transition: opacity 0.2s; } .btn-primary:hover { opacity: 0.85; }
+        .btn-ghost { padding: 10px; background: none; border: none; color: var(--danger); font-size: 13px; cursor: pointer; font-family: var(--font); }
+        .btn-secondary { padding: 11px; background: var(--surface2); border: 1px solid var(--border); color: var(--muted); border-radius: 10px; font-size: 13px; font-family: var(--font); cursor: pointer; }
+        .user-item { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 8px; cursor: pointer; transition: background 0.15s; } .user-item:hover { background: var(--surface2); }
+        .online-dot { width: 7px; height: 7px; background: var(--green); border-radius: 50%; flex-shrink: 0; }
+        .dm-tag { font-size: 10px; color: var(--accent); font-family: var(--mono); background: rgba(91,91,240,0.15); padding: 2px 6px; border-radius: 5px; }
+        .logo-mark { width: 52px; height: 52px; border-radius: 14px; background: var(--accent); margin: 0 auto 4px; display: flex; align-items: center; justify-content: center; font-size: 22px; box-shadow: 0 0 30px var(--sent-glow); }
+    </style>
+</head>
+<body>
+    <audio id="ping" src="data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAAFAAAAZwAAERERERERERERERERERERERERERERERERERERERERERERERERERERER//uQxAAAC0wJSAAAAAAEAAIABAAAAREbv3/8AAAAAABj/84AAABH////4sZ//uQxAAAAykNQAOAAAAIAAAACAAADI05c6wAAAACAAAABgAAAB5E//uQxAAAAzkNQAOAAAAIAAAACAAADJU5c6wAAAACAAAABgAAAB5E//uQxAAAA0kNQAOAAAAIAAAACAAADJU5c6wAAAACAAAABgAAAB5E"></audio>
+    <div id="reconnect-banner">⚠ RECONNECTING...</div>
+    <div id="sidebar">
+        <div class="sb-header">
+            <div id="sb-avatar" class="sb-avatar" onclick="openProfile()"></div>
+            <div id="sb-name" class="sb-name">Guest</div>
+            <div class="theme-row">
+                <div class="theme-dot" style="background:#5b5bf0;" onclick="setTheme('')" title="Violet"></div>
+                <div class="theme-dot" style="background:#000; border-color:#444;" onclick="setTheme('theme-void')" title="Void"></div>
+                <div class="theme-dot" style="background:#22c55e;" onclick="setTheme('theme-forest')" title="Forest"></div>
+                <div class="theme-dot" style="background:#f0f0f5; border-color:#ccc;" onclick="setTheme('theme-chrome')" title="Chrome"></div>
+            </div>
+        </div>
+        <div class="sb-section">Channels &amp; DMs</div>
+        <div style="flex:1; overflow-y:auto;" id="chat-list"></div>
+        <div class="sb-new-btn" onclick="showJoinModal()">+ New Chat</div>
+    </div>
+    <div id="overlay" onclick="closeSidebar()"></div>
+    <header>
+        <div class="header-left">
+            <button class="menu-btn" onclick="toggleMenu()">☰</button>
+            <div>
+                <div id="header-title" class="header-title">Lobby</div>
+                <div id="header-sub" class="header-sub">channel</div>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="pill-btn" onclick="showUsers()">👥 <span id="user-count-num">0</span></div>
+            <div class="pill-btn" onclick="adminClear()">🧹</div>
+        </div>
+    </header>
+    <div id="messages"></div>
+    <div id="typing-bar"></div>
+    <div class="composer">
+        <button class="icon-btn ghost" onclick="document.getElementById('fileIn').click()">📎</button>
+        <input type="file" id="fileIn" hidden onchange="sendFile()">
+        <button id="burn-btn" class="icon-btn ghost" onclick="toggleBurn()" title="Burn mode">🔥</button>
+        <button class="icon-btn ghost" onclick="startVideo()" title="Video call">📹</button>
+        <input id="inp" class="compose-input" placeholder="Message..." autocomplete="off" onkeydown="if(event.key==='Enter')send()">
+        <button id="mic" class="icon-btn danger" ontouchstart="recStart()" ontouchend="recStop()" onmousedown="recStart()" onmouseup="recStop()" title="Hold to record">🎙️</button>
+        <button class="icon-btn snap" onclick="snapShareInput()" title="Share to Snapchat">👻</button>
+        <button class="icon-btn primary" onclick="send()">↑</button>
+    </div>
+    
+    <div id="auth-modal" class="modal" style="display:flex;">
+        <div class="box">
+            <div class="logo-mark">⚡</div>
+            <h2 style="text-align:center;">Atothei</h2>
+            <p class="box-sub" style="text-align:center; margin:0 auto;">V16 · Neural Chat</p>
+            <input id="u_name" class="field" placeholder="Username" autocomplete="off">
+            <input id="u_pass" type="password" class="field" placeholder="Password" onkeydown="if(event.key==='Enter')auth('login')">
+            <button onclick="auth('login')" class="btn-primary">Sign In</button>
+            <button onclick="auth('register')" class="btn-secondary">Create Account</button>
+        </div>
+    </div>
+    <div id="users-modal" class="modal">
+        <div class="box">
+            <h3>Online Now</h3>
+            <div id="user-list-container"></div>
+            <button onclick="document.getElementById('users-modal').style.display='none'" class="btn-ghost">Close</button>
+        </div>
+    </div>
+    <div id="profile-modal" class="modal">
+        <div class="box">
+            <h3>My Profile</h3>
+            <div id="my-profile-pic-preview" class="avatar lg"></div>
+            <p style="font-size:12px; color:var(--muted);">Choose new avatar:</p>
+            <input type="file" id="avaIn" accept="image/*" class="field" style="padding:8px;">
+            <button onclick="uploadAva()" class="btn-primary">Save Avatar</button>
+            <button onclick="document.getElementById('profile-modal').style.display='none'" class="btn-ghost">Cancel</button>
+        </div>
+    </div>
+    <div id="join-modal" class="modal">
+        <div class="box">
+            <h3>New Chat</h3>
+            <input id="new_room" class="field" placeholder="Room name" autocomplete="off">
+            <input id="new_key" type="password" class="field" placeholder="Encryption key (optional)">
+            <button onclick="addChat()" class="btn-primary">Join</button>
+            <button onclick="closeJoinModal()" class="btn-ghost">Cancel</button>
+        </div>
+    </div>
+
+    <script>
+        const SNAP_CLIENT_ID = '703e566a-a8c1-4b26-8a90-b3cc3feb3147';
+        function initSnap() {
+            if (window.snap && window.snap.creativekit) {
+                window.snap.creativekit.init(SNAP_CLIENT_ID);
+            }
+        }
+        async function snapShare(text, mediaDataUrl) {
+            const caption = ((text || 'Join me on Atothei!').slice(0, 250)) + ' · via Atothei';
+            if (navigator.share) {
+                try {
+                    await navigator.share({ title: 'Atothei', text: caption, url: window.location.href });
+                } catch(e) { console.log('Share dismissed', e); }
+                return;
+            }
+            if (window.snap && window.snap.creativekit) {
+                const content = { caption, attachmentUrl: window.location.href };
+                window.snap.creativekit.share({ content });
+                return;
+            }
+            window.open('https://www.snapchat.com/scan?attachmentUrl=' + encodeURIComponent(window.location.href), '_blank');
+        }
+        function snapShareInput() {
+            const input = document.getElementById('inp') || document.querySelector('input[type=text], textarea');
+            const text = input ? input.value.trim() : '';
+            if (!text) { alert('Type something to share to Snap'); return; }
+            snapShare(text);
+        }
+        window.addEventListener('load', () => setTimeout(initSnap, 800));
+
+        var socket = io({ reconnection: true, reconnectionDelay: 1000, reconnectionAttempts: Infinity });
+        var myUser = "", myAvatar = "", currentChat = 'Lobby';
+        var burnMode = false;
+
+        function loadChats() {
+            try {
+                var s = localStorage.getItem('atothei_chats');
+                if (s) return JSON.parse(s);
+            } catch(e) {}
+            return { 'Lobby': { key: null, unread: 0 } };
+        }
+        function saveChats() {
+            try {
+                var out = {};
+                Object.keys(chats).forEach(r => {
+                    out[r] = { key: chats[r].key, unread: 0, isDM: chats[r].isDM || false, dmWith: chats[r].dmWith || null };
+                });
+                localStorage.setItem('atothei_chats', JSON.stringify(out));
+            } catch(e) {}
+        }
+        var chats = loadChats();
+
+        function auth(t) {
+            var u = document.getElementById('u_name').value.trim();
+            var p = document.getElementById('u_pass').value;
+            if (u && p) socket.emit('auth', { type: t, user: u, pass: p });
+        }
+        socket.on('auth_response', r => {
+            if (r.success) {
+                myUser = r.user; myAvatar = r.avatar || "";
+                updateProfileUI();
+                document.getElementById('auth-modal').style.display = 'none';
+                Object.keys(chats).forEach(room => socket.emit('join_channel', { room }));
+                switchChat('Lobby');
+            } else alert(r.message);
+        });
+
+        function updateProfileUI() {
+            document.getElementById('sb-name').innerText = myUser;
+            var bg = myAvatar ? `url('${myAvatar}')` : '';
+            document.getElementById('sb-avatar').style.backgroundImage = bg;
+            document.getElementById('my-profile-pic-preview').style.backgroundImage = bg;
+        }
+
+        socket.on('connect', () => {
+            document.getElementById('reconnect-banner').style.display = 'none';
+            if (myUser) Object.keys(chats).forEach(room => socket.emit('join_channel', { room }));
+        });
+        socket.on('disconnect', () => {
+            document.getElementById('reconnect-banner').style.display = 'block';
+        });
+
+        var onlineUsers = [];
+        socket.on('room_users', data => {
+            if (data.room === currentChat) document.getElementById('user-count-num').innerText = data.count;
+        });
+        socket.on('update_users', list => {
+            onlineUsers = list;
+            var c = document.getElementById('user-list-container');
+            c.innerHTML = '';
+            list.forEach(u => {
+                var d = document.createElement('div');
+                d.className = 'user-item';
+                var bg = u.avatar ? `url('${u.avatar}')` : '';
+                d.innerHTML = `
+                    <div class="avatar" style="background-image:${bg};background-size:cover;"></div>
+                    <div style="flex:1;font-size:13px;">${u.name}</div>
+                    ${u.name !== myUser ? '<span class="dm-tag">DM</span>' : ''}
+                    <div class="online-dot"></div>`;
+                if (u.name !== myUser) d.onclick = () => openDM(u.name);
+                c.appendChild(d);
+            });
+        });
+
+        function showUsers() { document.getElementById('users-modal').style.display = 'flex'; }
+        function openDM(username) {
+            document.getElementById('users-modal').style.display = 'none';
+            var dmRoom = [myUser, username].sort().join('__');
+            if (!chats[dmRoom]) chats[dmRoom] = { key: null, unread: 0, isDM: true, dmWith: username };
+            saveChats(); switchChat(dmRoom);
+        }
+
+        function openProfile() { document.getElementById('profile-modal').style.display = 'flex'; closeSidebar(); }
+        function uploadAva() {
+            var f = document.getElementById('avaIn').files[0];
+            if (!f) return;
+            var r = new FileReader();
+            r.onload = e => {
+                myAvatar = e.target.result;
+                socket.emit('update_avatar', { user: myUser, avatar: myAvatar });
+                updateProfileUI();
+                document.getElementById('profile-modal').style.display = 'none';
+            };
+            r.readAsDataURL(f);
+        }
+
+        function setTheme(cls) { document.body.className = cls; }
+        function toggleBurn() {
+            burnMode = !burnMode;
+            document.getElementById('burn-btn').className = 'icon-btn ' + (burnMode ? 'burn-on' : 'ghost');
+        }
+        function startVideo() {
+            var room = 'atothei-' + currentChat.replace(/[^a-z0-9]/gi,'') + '-' + Math.floor(Math.random()*9999);
+            socket.emit('send_msg', { room: currentChat, user: myUser, text: 'https://meet.jit.si/' + room, isEncrypted: false, burn: false });
+        }
+
+        function switchChat(r) {
+            if (currentChat && currentChat !== r) socket.emit('leave_channel', { room: currentChat });
+            currentChat = r;
+            if (!chats[r]) chats[r] = { key: null, unread: 0 };
+            chats[r].unread = 0; saveChats();
+            var info = chats[r];
+            document.getElementById('header-title').innerText = info.isDM ? ('💬 ' + info.dmWith) : ((info.key ? '🔒 ' : '# ') + r);
+            document.getElementById('header-sub').innerText = info.isDM ? 'direct message' : 'channel';
+            document.getElementById('messages').innerHTML = '';
+            socket.emit('join_channel', { room: r });
+            closeSidebar(); renderList();
+        }
+
+        function send() {
+            var i = document.getElementById('inp');
+            if (!i.value.trim()) return;
+            var k = chats[currentChat] ? chats[currentChat].key : null;
+            var txt = k ? CryptoJS.AES.encrypt(i.value, k).toString() : i.value;
+            socket.emit('send_msg', { room: currentChat, user: myUser, text: txt, isEncrypted: !!k, burn: burnMode });
+            i.value = '';
+            if (burnMode) toggleBurn();
+        }
+
+        socket.on('sys_msg', d => {
+            if (d.room === currentChat) {
+                var el = document.getElementById('messages');
+                var div = document.createElement('div');
+                div.style = 'text-align:center;font-size:11px;color:var(--muted);padding:4px;font-family:var(--mono)';
+                div.textContent = d.text;
+                el.appendChild(div); el.scrollTop = el.scrollHeight;
+            }
+        });
+        socket.on('message', m => {
+            if (m.room === currentChat) {
+                renderMsg(m);
+                if (m.user !== myUser) try { document.getElementById('ping').play(); } catch(e) {}
+            } else {
+                if (!chats[m.room]) chats[m.room] = { key: null, unread: 0 };
+                chats[m.room].unread = (chats[m.room].unread || 0) + 1;
+                saveChats(); renderList();
+            }
+        });
+        socket.on('history', ms => { document.getElementById('messages').innerHTML = ''; ms.forEach(renderMsg); });
+
+        socket.on('burn_msg', data => {
+            var el = document.getElementById('msg-' + data.id);
+            if (el) { el.style.transition = 'opacity 0.8s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 800); }
+        });
+
+        function reactTo(msgId) { socket.emit('react_msg', { id: msgId, room: currentChat }); }
+        socket.on('reaction_update', data => {
+            var el = document.getElementById('rc-' + data.id);
+            if (el) el.innerText = '👍 ' + data.reactions;
+        });
+
+        var typingTimer;
+        document.getElementById('inp').addEventListener('input', () => { socket.emit('typing', { room: currentChat, user: myUser }); });
+        socket.on('display_typing', d => {
+            if (d.room === currentChat && d.user !== myUser) {
+                var b = document.getElementById('typing-bar');
+                b.innerText = d.user + ' is typing...'; b.style.display = 'block';
+                clearTimeout(typingTimer);
+                typingTimer = setTimeout(() => b.style.display = 'none', 2000);
+            }
+        });
+
+        function renderMsg(m) {
+            var row = document.createElement('div');
+            row.className = 'msg-row ' + (m.user === myUser ? 'sent' : 'received');
+            row.id = 'msg-' + m.id;
+            var txt = m.text || '', fd = m.file ? m.file.data : null;
+            var k = (chats[currentChat] || {}).key || null;
+            
+            if (m.isEncrypted && k) {
+                try {
+                    txt = CryptoJS.AES.decrypt(m.text, k).toString(CryptoJS.enc.Utf8);
+                    if (fd) fd = CryptoJS.AES.decrypt(fd, k).toString(CryptoJS.enc.Utf8);
+                } catch(e) { txt = '🔒 Decryption failed'; }
+            } else if (m.isEncrypted && !k) { txt = '🔒 Encrypted'; fd = null; }
+            
+            if (txt && txt.includes('https://meet.jit.si')) {
+                txt = `📞 <strong>Video Call Invite</strong><br><a href="${txt}" target="_blank" style="display:inline-block;margin-top:6px;padding:6px 14px;background:var(--green); color:#000;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none;">JOIN CALL</a>`;
+            }
+            
+            var body = '';
+            if (txt) body += `<div>${txt}</div>`;
+            if (fd) {
+                if (fd.startsWith('data:audio')) body += `<audio controls src="${fd}" style="margin-top:6px;width:200px;"></audio>`;
+                else if (fd.startsWith('data:image')) body += `<img src="${fd}" class="chat-media">`;
+                else if (m.file) body += `<div style="background:rgba(255,255,255,0.05);padding:8px;border-radius:8px;margin-top:5px;font-size:12px;">📄 ${m.file.name}</div>`;
+            }
+            
+            var ava = m.avatar || '';
+            var avaEl = `<div class="avatar" style="background-image:url('${ava}');background-size:cover;"></div>`;
+            var burnLabel = m.burn ? `<div class="burn-timer">🔥 Burns in ${m.burnSeconds || 10}s</div>` : '';
+            
+            var bubble = `
+                <div class="msg-bubble ${m.burn ? 'burn-msg' : ''}">
+                    <div class="msg-sender">${m.user}</div>
+                    ${body}${burnLabel}
+                    <div class="msg-time">${m.time}</div>
+                    <div class="reaction-bar">
+                        <button class="react-btn" id="rc-${m.id}" onclick="reactTo(${m.id})">👍 ${m.reactions || 0}</button>
+                    </div>
+                </div>`;
+                
+            row.innerHTML = m.user === myUser ? (bubble + avaEl) : (avaEl + bubble);
+            document.getElementById('messages').appendChild(row);
+            document.getElementById('messages').scrollTop = 999999;
+        }
+
+        function renderList() {
+            var l = document.getElementById('chat-list');
+            l.innerHTML = '';
+            Object.keys(chats).forEach(r => {
+                var info = chats[r];
+                var d = document.createElement('div');
+                d.className = 'chat-item' + (r === currentChat ? ' active' : '');
+                var label = info.isDM ? ('💬 ' + (info.dmWith || r)) : ((info.key ? '🔒 ' : '# ') + r);
+                var badge = info.unread > 0 ? `<span class="unread-badge">${info.unread}</span>` : '';
+                d.innerHTML = `<span>${label}</span>${badge}`;
+                d.onclick = () => switchChat(r);
+                l.appendChild(d);
+            });
+        }
+
+        function toggleMenu() {
+            var s = document.getElementById('sidebar');
+            if (s.classList.contains('open')) closeSidebar();
+            else { s.classList.add('open'); document.getElementById('overlay').style.display = 'block'; renderList(); }
+        }
+        function closeSidebar() { document.getElementById('sidebar').classList.remove('open'); document.getElementById('overlay').style.display = 'none'; }
+        function showJoinModal() { document.getElementById('join-modal').style.display = 'flex'; closeSidebar(); }
+        function closeJoinModal() { document.getElementById('join-modal').style.display = 'none'; }
+        
+        function addChat() {
+            var r = document.getElementById('new_room').value.trim();
+            var k = document.getElementById('new_key').value;
+            if (!r) return;
+            chats[r] = { key: k || null, unread: 0 };
+            saveChats(); switchChat(r); closeJoinModal();
+            document.getElementById('new_room').value = ''; document.getElementById('new_key').value = '';
+        }
+        function adminClear() {
+            if (confirm('Clear all messages in ' + currentChat + '?')) socket.emit('admin_clear', { room: currentChat });
+        }
+        socket.on('clear_chat', r => { if (r === currentChat) document.getElementById('messages').innerHTML = ''; });
+
+        var mediaRec, chunks = [];
+        async function recStart() {
+            try {
+                var s = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRec = new MediaRecorder(s); chunks = [];
+                mediaRec.ondataavailable = e => chunks.push(e.data);
+                mediaRec.onstop = sendVoice; mediaRec.start();
+                document.getElementById('mic').style.opacity = '0.5';
+            } catch(e) { alert('Microphone access blocked'); }
+        }
+        function recStop() {
+            if (mediaRec && mediaRec.state !== 'inactive') mediaRec.stop();
+            document.getElementById('mic').style.opacity = '1';
+        }
+        function sendVoice() {
+            if (!chunks.length) return;
+            var b = new Blob(chunks, { type: 'audio/webm' });
+            var r = new FileReader();
+            r.onload = e => {
+                var k = (chats[currentChat] || {}).key;
+                var d = k ? CryptoJS.AES.encrypt(e.target.result, k).toString() : e.target.result;
+                socket.emit('send_msg', { room: currentChat, user: myUser, text: '', isEncrypted: !!k, burn: burnMode, file: { name: 'voice.webm', type: 'audio/webm', data: d } });
+            };
+            r.readAsDataURL(b);
+        }
+        function sendFile() {
+            var f = document.getElementById('fileIn').files[0];
+            if (!f) return;
+            if (f.size > 10 * 1024 * 1024) { alert('Max file size is 10MB'); return; }
+            var r = new FileReader();
+            r.onload = e => {
+                var k = (chats[currentChat] || {}).key;
+                var d = k ? CryptoJS.AES.encrypt(e.target.result, k).toString() : e.target.result;
+                socket.emit('send_msg', { room: currentChat, user: myUser, text: '', isEncrypted: !!k, burn: burnMode, file: { name: f.name, type: f.type, data: d } });
+            };
+            r.readAsDataURL(f);
+        }
+    </script>
+</body>
+</html>
+EOF
+
+echo "Deployment finished! You can now start the server."
+
