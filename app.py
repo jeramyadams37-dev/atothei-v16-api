@@ -1,3 +1,6 @@
+import eventlet
+eventlet.monkey_patch()
+
 from fastapi import FastAPI
 
 app = FastAPI(title="Atothei v16 API", version="1.0.0")
