@@ -117,6 +117,13 @@ def handle_auth(data):
 @socketio.on('join_channel')
 def on_join(data):
     r = data['room']
+    u = connected_users.get(request.sid, '')
+
+    if db.channel_exists(r) and db.is_channel_private(r):
+        if not u or not db.is_member(r, u):
+            emit('join_error', {'room': r, 'message': 'This channel is private. You need an invite to join.'})
+            return
+
     join_room(r)
     if r not in room_members:
         room_members[r] = set()
@@ -126,7 +133,6 @@ def on_join(data):
     broadcast_users()
     broadcast_room_count(r)
     
-    u = connected_users.get(request.sid, '')
     if u:
         socketio.emit('sys_msg', {'room': r, 'text': f'{u} joined'}, to=r)
 
@@ -175,6 +181,66 @@ def on_typing(data):
 def on_ava(data):
     db.update_avatar(data['user'], data['avatar'])
     broadcast_users()
+
+@socketio.on('create_channel')
+def on_create_channel(data):
+    name = str(data.get('name', '')).strip()
+    is_private = 1 if data.get('private', True) else 0
+    u = connected_users.get(request.sid, '')
+
+    if not u:
+        emit('channel_error', {'message': 'You must be logged in to create a channel.'})
+        return
+    if not name:
+        emit('channel_error', {'message': 'Channel name cannot be empty.'})
+        return
+
+    success = db.create_channel(name, u, is_private)
+    if success:
+        emit('channel_created', {'name': name, 'private': bool(is_private)})
+    else:
+        emit('channel_error', {'message': f'Channel "{name}" already exists.'})
+
+@socketio.on('generate_invite')
+def on_generate_invite(data):
+    room = data.get('room')
+    max_uses = data.get('maxUses')
+    u = connected_users.get(request.sid, '')
+
+    if not u:
+        emit('channel_error', {'message': 'You must be logged in to create an invite.'})
+        return
+    if not db.channel_exists(room) or not db.is_channel_owner(room, u):
+        emit('channel_error', {'message': 'Only the channel owner can generate invites.'})
+        return
+
+    code = db.create_invite(room, u, max_uses)
+    emit('invite_created', {'room': room, 'code': code})
+
+@socketio.on('join_via_invite')
+def on_join_via_invite(data):
+    code = data.get('code')
+    u = connected_users.get(request.sid, '')
+
+    if not u:
+        emit('channel_error', {'message': 'You must be logged in to use an invite.'})
+        return
+
+    room = db.consume_invite(code, u)
+    if not room:
+        emit('channel_error', {'message': 'Invalid or expired invite code.'})
+        return
+
+    join_room(room)
+    if room not in room_members:
+        room_members[room] = set()
+    room_members[room].add(request.sid)
+
+    emit('invite_joined', {'room': room})
+    emit('history', db.get_history(room))
+    broadcast_users()
+    broadcast_room_count(room)
+    socketio.emit('sys_msg', {'room': room, 'text': f'{u} joined via invite'}, to=room)
 
 @socketio.on('admin_clear')
 def on_clear(data):

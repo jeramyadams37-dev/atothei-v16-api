@@ -1,6 +1,7 @@
 import sqlite3
 import datetime
 import hashlib
+import secrets
 
 DB_FILE = "atothei.db"
 
@@ -12,6 +13,9 @@ def init_db():
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, avatar_data TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, room TEXT, user TEXT, avatar TEXT, text TEXT, file_name TEXT, file_type TEXT, file_data TEXT, is_encrypted INTEGER, reactions INTEGER DEFAULT 0, burn INTEGER DEFAULT 0, burn_seconds INTEGER DEFAULT 10, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS channels (name TEXT PRIMARY KEY, owner TEXT, is_private INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS channel_members (channel TEXT, username TEXT, PRIMARY KEY (channel, username))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS invites (code TEXT PRIMARY KEY, channel TEXT, created_by TEXT, max_uses INTEGER, uses INTEGER DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)''')
         conn.commit()
 
 def save_user(user, pwd):
@@ -80,3 +84,55 @@ def get_history(room):
                 msg['file'] = {'name': r[4], 'type': r[5], 'data': r[6]}
             history.append(msg)
     return history
+
+
+def create_channel(name, owner, is_private=1):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("INSERT INTO channels (name, owner, is_private) VALUES (?, ?, ?)", (name, owner, 1 if is_private else 0))
+            conn.execute("INSERT OR IGNORE INTO channel_members (channel, username) VALUES (?, ?)", (name, owner))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+def channel_exists(name):
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT 1 FROM channels WHERE name = ?", (name,)).fetchone()
+        return row is not None
+
+def is_channel_private(name):
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT is_private FROM channels WHERE name = ?", (name,)).fetchone()
+        return bool(row[0]) if row else False
+
+def is_channel_owner(name, username):
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT owner FROM channels WHERE name = ?", (name,)).fetchone()
+        return row and row[0] == username
+
+def is_member(channel, username):
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT 1 FROM channel_members WHERE channel = ? AND username = ?", (channel, username)).fetchone()
+        return row is not None
+
+def add_member(channel, username):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("INSERT OR IGNORE INTO channel_members (channel, username) VALUES (?, ?)", (channel, username))
+
+def create_invite(channel, created_by, max_uses=None):
+    code = secrets.token_urlsafe(6)
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("INSERT INTO invites (code, channel, created_by, max_uses) VALUES (?, ?, ?, ?)", (code, channel, created_by, max_uses))
+    return code
+
+def consume_invite(code, username):
+    with sqlite3.connect(DB_FILE) as conn:
+        row = conn.execute("SELECT channel, max_uses, uses FROM invites WHERE code = ?", (code,)).fetchone()
+        if not row:
+            return None
+        channel, max_uses, uses = row
+        if max_uses is not None and uses >= max_uses:
+            return None
+        conn.execute("UPDATE invites SET uses = uses + 1 WHERE code = ?", (code,))
+        conn.execute("INSERT OR IGNORE INTO channel_members (channel, username) VALUES (?, ?)", (channel, username))
+        return channel
