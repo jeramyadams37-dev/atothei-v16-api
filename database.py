@@ -174,3 +174,15 @@ def consume_invite(code, username):
         c.execute("INSERT INTO channel_members (channel, username) VALUES (%s, %s) ON CONFLICT DO NOTHING", (channel, username))
         conn.commit()
         return channel
+
+def delete_channel(name, username):
+    if not is_channel_owner(name, username):
+        return False
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM channels WHERE name = %s", (name,))
+        c.execute("DELETE FROM channel_members WHERE channel = %s", (name,))
+        c.execute("DELETE FROM invites WHERE channel = %s", (name,))
+        c.execute("DELETE FROM messages WHERE room = %s", (name,))
+        conn.commit()
+    return True

@@ -250,6 +250,20 @@ def on_clear(data):
     db.clear_room(data['room'])
     emit('clear_chat', data['room'], to=data['room'])
 
+
+@socketio.on('delete_channel')
+def on_delete_channel(data):
+    room = data.get('room')
+    u = connected_users.get(request.sid, '')
+    if not u: return
+    if room == 'Lobby':
+        emit('channel_error', {'message': 'Cannot delete the Lobby.'})
+        return
+    if db.delete_channel(room, u):
+        socketio.emit('channel_deleted', {'room': room})
+    else:
+        emit('channel_error', {'message': 'Only the owner can permanently delete this channel.'})
+
 if __name__ == '__main__':
     db.init_db()
     try:

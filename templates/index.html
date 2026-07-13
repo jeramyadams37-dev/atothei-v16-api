@@ -111,6 +111,7 @@
         <div class="header-right">
             <div class="pill-btn" onclick="showUsers()">👥 <span id="user-count-num">0</span></div>
             <div class="pill-btn" onclick="showInviteModal()">✉️</div>
+            <div class="pill-btn" onclick="deleteChannel()" title="Delete Channel">🗑️</div>
             <div class="pill-btn" onclick="adminClear()">🧹</div>
         </div>
     </header>
@@ -513,6 +514,27 @@
         function adminClear() {
             if (confirm('Clear all messages in ' + currentChat + '?')) socket.emit('admin_clear', { room: currentChat });
         }
+        
+        function deleteChannel() {
+            if (currentChat === 'Lobby') { alert("Cannot delete the public Lobby."); return; }
+            if (confirm("Permanently delete #" + currentChat + " and all its history? Only the owner can do this.")) {
+                socket.emit('delete_channel', { room: currentChat });
+            }
+        }
+        
+        socket.on('channel_deleted', data => {
+            if (chats[data.room]) { 
+                delete chats[data.room]; 
+                saveChats(); 
+            }
+            if (currentChat === data.room) { 
+                alert("#" + data.room + " was deleted by the owner.");
+                switchChat('Lobby'); 
+            } else { 
+                renderList(); 
+            }
+        });
+
         socket.on('clear_chat', r => { if (r === currentChat) document.getElementById('messages').innerHTML = ''; });
 
         var mediaRec, chunks = [];
