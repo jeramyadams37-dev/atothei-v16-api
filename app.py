@@ -5,6 +5,7 @@ from psycogreen.gevent import patch_psycopg
 patch_psycopg()
 
 import os
+import secrets
 import socket
 import subprocess
 import threading
@@ -21,6 +22,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent', max_http
 db.init_db()
 
 connected_users = {}
+active_sessions = {}  # token -> username, survives reconnects
 room_members = {}
 
 def start_public_tunnel():
@@ -113,9 +115,23 @@ def handle_auth(data):
             
     if success:
         connected_users[request.sid] = u
+        token = secrets.token_hex(16)
+        active_sessions[token] = u
         ava = db.get_user_avatar(u)
-        emit('auth_response', {'success': True, 'user': u, 'avatar': ava})
+        emit('auth_response', {'success': True, 'user': u, 'avatar': ava, 'token': token})
         broadcast_users()
+
+@socketio.on('resume_session')
+def handle_resume_session(data):
+    token = data.get('token')
+    u = active_sessions.get(token)
+    if u:
+        connected_users[request.sid] = u
+        ava = db.get_user_avatar(u)
+        emit('resume_response', {'success': True, 'user': u, 'avatar': ava})
+        broadcast_users()
+    else:
+        emit('resume_response', {'success': False})
 
 @socketio.on('join_channel')
 def on_join(data):

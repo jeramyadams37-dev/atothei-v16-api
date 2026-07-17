@@ -221,7 +221,7 @@
         window.addEventListener('load', () => setTimeout(initSnap, 800));
 
         var socket = io({ reconnection: true, reconnectionDelay: 1000, reconnectionAttempts: Infinity });
-        var myUser = "", myAvatar = "", currentChat = 'Lobby';
+        var myUser = "", myAvatar = "", mySessionToken = "", currentChat = 'Lobby';
         var burnMode = false;
 
         function loadChats() {
@@ -250,11 +250,19 @@
         socket.on('auth_response', r => {
             if (r.success) {
                 myUser = r.user; myAvatar = r.avatar || "";
+                mySessionToken = r.token || "";
                 updateProfileUI();
                 document.getElementById('auth-modal').style.display = 'none';
                 Object.keys(chats).forEach(room => socket.emit('join_channel', { room }));
                 switchChat('Lobby');
             } else alert(r.message);
+        });
+        socket.on('resume_response', r => {
+            if (r.success) {
+                myUser = r.user; myAvatar = r.avatar || "";
+                updateProfileUI();
+                Object.keys(chats).forEach(room => socket.emit('join_channel', { room }));
+            }
         });
 
         function updateProfileUI() {
@@ -266,7 +274,11 @@
 
         socket.on('connect', () => {
             document.getElementById('reconnect-banner').style.display = 'none';
-            if (myUser) Object.keys(chats).forEach(room => socket.emit('join_channel', { room }));
+            if (mySessionToken) {
+                socket.emit('resume_session', { token: mySessionToken });
+            } else if (myUser) {
+                Object.keys(chats).forEach(room => socket.emit('join_channel', { room }));
+            }
         });
         socket.on('disconnect', () => {
             document.getElementById('reconnect-banner').style.display = 'block';
