@@ -345,6 +345,22 @@ def on_join_via_invite(data):
     if created_by and created_by != u:
         notify_user(created_by, 'invite', f"{u} joined #{room} using your invite", room)
 
+@socketio.on('get_notifications')
+def on_get_notifications():
+    u = connected_users.get(request.sid, '')
+    if not u:
+        return
+    emit('notifications_list', {
+        'notifications': db.get_notifications(u),
+        'unread': db.get_unread_count(u)
+    })
+
+@socketio.on('mark_notifications_read')
+def on_mark_notifications_read():
+    u = connected_users.get(request.sid, '')
+    if u:
+        db.mark_notifications_read(u)
+
 @socketio.on('admin_clear')
 def on_clear(data):
     db.clear_room(data['room'])
