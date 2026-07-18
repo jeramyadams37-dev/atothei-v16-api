@@ -21,12 +21,12 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent', max_http
 
 # Initialize DB at import time so it runs under gunicorn too
 db.init_db()
+ADMIN_USERNAME = "Jeramy"
+ADMIN_ALERTS_ROOM = "🚨 Admin Alerts"
 db.ensure_admin_channel(ADMIN_USERNAME, ADMIN_ALERTS_ROOM)
 
 connected_users = {}
 active_sessions = {}  # token -> username, survives reconnects
-ADMIN_USERNAME = "Jeramy"
-ADMIN_ALERTS_ROOM = "🚨 Admin Alerts"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 user_active_room = {}  # sid -> room currently being viewed
 
