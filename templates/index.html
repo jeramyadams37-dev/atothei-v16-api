@@ -87,8 +87,16 @@
         .dm-tag { font-size: 10px; color: var(--accent); font-family: var(--mono); background: rgba(91,91,240,0.15); padding: 2px 6px; border-radius: 5px; }
         .logo-mark { width: 52px; height: 52px; border-radius: 14px; background: var(--accent); margin: 0 auto 4px; display: flex; align-items: center; justify-content: center; font-size: 22px; box-shadow: 0 0 30px var(--sent-glow); }
     </style>
+
+    <style id="toast-styles">
+        #toast-container { position: fixed; top: 70px; right: 16px; z-index: 100; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+        .toast { pointer-events: auto; background: var(--surface2); border: 1px solid var(--accent); color: var(--text); padding: 12px 16px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); font-size: 13px; animation: slideIn 0.3s ease forwards; cursor: pointer; max-width: 280px; }
+        @keyframes slideIn { from { transform: translateX(120%); } to { transform: translateX(0); } }
+        @keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+    </style>
 </head>
 <body>
+    <div id="toast-container"></div>
     <audio id="ping" src="data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAAFAAAAZwAAERERERERERERERERERERERERERERERERERERERERERERERERERERER//uQxAAAC0wJSAAAAAAEAAIABAAAAREbv3/8AAAAAABj/84AAABH////4sZ//uQxAAAAykNQAOAAAAIAAAACAAADI05c6wAAAACAAAABgAAAB5E//uQxAAAAzkNQAOAAAAIAAAACAAADJU5c6wAAAACAAAABgAAAB5E//uQxAAAA0kNQAOAAAAIAAAACAAADJU5c6wAAAACAAAABgAAAB5E"></audio>
     <div id="reconnect-banner">⚠ RECONNECTING...</div>
     <div id="sidebar">
@@ -396,6 +404,71 @@
                 pendingPrivateRoom = null;
             }
         });
+        
+        socket.on('notifications_list', data => {
+            let unread = data.unread || 0;
+            let list = data.notifications || [];
+            let badge = document.getElementById('notif-badge');
+            if (unread > 0) {
+                badge.style.display = 'inline-block';
+                badge.innerText = unread;
+            } else {
+                badge.style.display = 'none';
+            }
+            
+            let container = document.getElementById('notif-list-container');
+            if (list.length === 0) {
+                container.innerHTML = '<p style="font-size:12px; color:var(--muted); text-align:center;">No new notifications.</p>';
+            } else {
+                container.innerHTML = list.map(n => {
+                    let bg = n.read ? 'transparent' : 'rgba(91,91,240,0.1)';
+                    let action = n.room ? `onclick="switchChat('${n.room}'); document.getElementById('notif-modal').style.display='none';"` : '';
+                    return `<div style="padding:10px; border-radius:8px; background:${bg}; border:1px solid var(--border); font-size:12px; cursor:${n.room ? 'pointer' : 'default'};" ${action}>
+                        <div style="font-weight:600; margin-bottom:4px; color:var(--accent2);">${n.type.toUpperCase()}</div>
+                        <div>${n.content}</div>
+                    </div>`;
+                }).join('');
+            }
+        });
+
+        function showToast(title, body, room) {
+            let tc = document.getElementById('toast-container');
+            let t = document.createElement('div');
+            t.className = 'toast';
+            t.innerHTML = `<strong>${title}</strong><br><span style="color:var(--muted); font-size:11px;">${body}</span>`;
+            if (room) {
+                t.onclick = () => { switchChat(room); t.remove(); };
+            }
+            tc.appendChild(t);
+            setTimeout(() => {
+                t.style.animation = 'fadeOut 0.3s ease forwards';
+                setTimeout(() => t.remove(), 300);
+            }, 5000);
+        }
+
+        socket.on('notification', data => {
+            showToast("New Notification", data.content, data.room);
+            let badge = document.getElementById('notif-badge');
+            let current = parseInt(badge.innerText) || 0;
+            badge.style.display = 'inline-block';
+            badge.innerText = current + 1;
+            
+            if (data.room && data.room !== currentChat) {
+                if (chats[data.room]) {
+                    chats[data.room].unread = (chats[data.room].unread || 0) + 1;
+                    saveChats();
+                    renderList();
+                }
+            }
+        });
+
+        socket.on('account_suspended', data => {
+            alert("🚨 ACCOUNT SUSPENDED:\n\n" + data.reason);
+            localStorage.clear();
+            sessionStorage.clear();
+            window.location.reload();
+        });
+
         socket.on('channel_error', data => { alert(data.message); });
         socket.on('join_error', data => { alert(data.message); });
         socket.on('invite_created', data => {
