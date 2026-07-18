@@ -21,6 +21,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent', max_http
 
 # Initialize DB at import time so it runs under gunicorn too
 db.init_db()
+db.ensure_admin_channel(ADMIN_USERNAME, ADMIN_ALERTS_ROOM)
 
 connected_users = {}
 active_sessions = {}  # token -> username, survives reconnects
@@ -222,6 +223,22 @@ def on_leave(data):
 
 @socketio.on('send_msg')
 def on_msg(data):
+    text = data.get('text') or ''
+    sender = data['user']
+
+    if not data.get('isEncrypted') and check_keywords(text):
+        verdict = call_gemini_moderation(text)
+        db.log_moderation_flag(data['room'], sender, text, verdict.get('reason', ''), verdict.get('action', 'allow'))
+        if verdict.get('action') == 'suspend':
+            db.suspend_user(sender, verdict.get('reason', 'Flagged by AI moderator'))
+            emit('account_suspended', {'reason': verdict.get('reason', 'Flagged by AI moderator')})
+            notify_user(
+                ADMIN_USERNAME, 'moderation',
+                f"Auto-suspended {sender} in #{data['room']}: {verdict.get('reason', '')}",
+                ADMIN_ALERTS_ROOM
+            )
+            return
+
     ava = db.get_user_avatar(data['user'])
     burn_sec = int(data.get('burnSeconds', 10))
     mid, ts = db.save_message(
@@ -236,6 +253,13 @@ def on_msg(data):
     data['time'] = ts	
     data['burnSeconds'] = burn_sec
     emit('message', data, to=data['room'])
+
+    preview = (data.get('text') or '')[:60] or '(attachment)'
+    for sid, uname in list(connected_users.items()):
+        if uname == data['user']:
+            continue
+        if sid in room_members.get(data['room'], set()) and user_active_room.get(sid) != data['room']:
+            notify_user(uname, 'message', f"{data['user']} in #{data['room']}: {preview}", data['room'])
     
     if data.get('burn'):
         schedule_burn(mid, data['room'], burn_sec)
@@ -244,6 +268,10 @@ def on_msg(data):
 def on_react(data):
     new_count = db.add_reaction(data['id'])
     emit('reaction_update', {'id': data['id'], 'reactions': new_count}, to=data['room'])
+    owner = db.get_message_owner(data['id'])
+    reactor = connected_users.get(request.sid, '')
+    if owner and reactor and owner != reactor:
+        notify_user(owner, 'reaction', f"{reactor} reacted to your message in #{data['room']}", data['room'])
 
 @socketio.on('typing')
 def on_typing(data):
@@ -298,7 +326,7 @@ def on_join_via_invite(data):
         emit('channel_error', {'message': 'You must be logged in to use an invite.'})
         return
 
-    room = db.consume_invite(code, u)
+    room, created_by = db.consume_invite(code, u)
     if not room:
         emit('channel_error', {'message': 'Invalid or expired invite code.'})
         return
@@ -307,12 +335,15 @@ def on_join_via_invite(data):
     if room not in room_members:
         room_members[room] = set()
     room_members[room].add(request.sid)
+    user_active_room[request.sid] = room
 
     emit('invite_joined', {'room': room})
     emit('history', db.get_history(room))
     broadcast_users()
     broadcast_room_count(room)
     socketio.emit('sys_msg', {'room': room, 'text': f'{u} joined via invite'}, to=room)
+    if created_by and created_by != u:
+        notify_user(created_by, 'invite', f"{u} joined #{room} using your invite", room)
 
 @socketio.on('admin_clear')
 def on_clear(data):
