@@ -270,6 +270,7 @@
                 updateProfileUI();
                 document.getElementById('auth-modal').style.display = 'none';
             socket.emit('get_notifications');
+            socket.emit('get_notifications');
                 Object.keys(chats).forEach(room => socket.emit('join_channel', { room }));
                 switchChat('Lobby');
             } else alert(r.message);
