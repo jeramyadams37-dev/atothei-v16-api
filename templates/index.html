@@ -119,6 +119,7 @@
             <div class="pill-btn" onclick="showUsers()">👥 <span id="user-count-num">0</span></div>
             <div class="pill-btn" onclick="showInviteModal()">✉️</div>
             <div class="pill-btn" onclick="deleteChannel()" title="Delete Channel">🗑️</div>
+            <div class="pill-btn" onclick="showNotifs()" title="Notifications">🔔 <span id="notif-badge" class="unread-badge" style="display:none; margin-left:4px;">0</span></div>
             <div class="pill-btn" onclick="adminClear()">🧹</div>
         </div>
     </header>
@@ -534,6 +535,19 @@
             if (confirm('Clear all messages in ' + currentChat + '?')) socket.emit('admin_clear', { room: currentChat });
         }
         
+        
+        function showNotifs() {
+            document.getElementById('notif-modal').style.display = 'flex';
+            socket.emit('get_notifications');
+        }
+        
+        function markAllRead() {
+            socket.emit('mark_notifications_read');
+            document.getElementById('notif-badge').style.display = 'none';
+            document.getElementById('notif-badge').innerText = '0';
+            document.getElementById('notif-list-container').innerHTML = '<p style="font-size:12px; color:var(--muted); text-align:center;">No new notifications.</p>';
+        }
+
         function deleteChannel() {
             if (currentChat === 'Lobby') { alert("Cannot delete the public Lobby."); return; }
             if (confirm("Permanently delete #" + currentChat + " and all its history? Only the owner can do this.")) {
@@ -594,5 +608,19 @@
             r.readAsDataURL(f);
         }
     </script>
+
+    <div id="notif-modal" class="modal">
+        <div class="box">
+            <h3 style="display:flex; justify-content:space-between; align-items:center;">
+                Notifications
+                <span class="btn-ghost" onclick="markAllRead()" style="font-size:11px; padding:0; cursor:pointer;">Mark All Read</span>
+            </h3>
+            <div id="notif-list-container" style="display:flex; flex-direction:column; gap:8px; margin-top:8px; max-height:250px; overflow-y:auto;">
+                <p style="font-size:12px; color:var(--muted); text-align:center;">Loading...</p>
+            </div>
+            <button class="btn-ghost" onclick="document.getElementById('notif-modal').style.display='none'">Close</button>
+        </div>
+    </div>
+
 </body>
 </html>
