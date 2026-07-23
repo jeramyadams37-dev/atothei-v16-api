@@ -25,3 +25,4 @@ gevent>=24.10.1
 psycopg2-binary>=2.9.9
 psycogreen>=1.0.2
 requests
+gevent-websocket>=0.10.1
